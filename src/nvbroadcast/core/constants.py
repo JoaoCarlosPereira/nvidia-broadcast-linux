@@ -43,8 +43,6 @@ MAXINE_VFX_PATH = Path("/usr/local/VideoFX")
 MAXINE_AFX_PATH = Path("/usr/local/AudioFX")
 MAXINE_AR_PATH = Path("/usr/local/ARFX")
 
-COMPUTE_GPU_INDEX = 0  # RTX 5060 (Blackwell)
-
 # NVIDIA Brand Colors
 NVIDIA_GREEN = "#76b900"
 NVIDIA_DARK_BG = "#1a1a1a"

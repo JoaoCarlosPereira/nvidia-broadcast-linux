@@ -61,6 +61,8 @@ class VideoPipeline:
         self._effect_callback = None
         self._alpha_callback = None
         self._preview_callback = None
+        self._capture_error_callback = None
+        self._capture_error_reported = False
         self._preview_enabled = True
         self._preview_timer_id = 0
         self._vcam_appsrc = None
@@ -426,6 +428,15 @@ class VideoPipeline:
     def set_preview_callback(self, callback):
         self._preview_callback = callback
 
+    def set_capture_error_callback(self, callback):
+        """Report physical-camera failures to the application once.
+
+        The application owns device re-enumeration and delayed restart.  Keeping
+        that policy out of the GStreamer bus callback prevents nested rebuilds
+        while udev is still removing or recreating `/dev/video*` nodes.
+        """
+        self._capture_error_callback = callback
+
     def set_capture_idle(self, idle: bool) -> bool:
         """Idle the capture pipeline while keeping the vcam device open.
 
@@ -575,6 +586,7 @@ class VideoPipeline:
     def build(self, vcam_enabled: bool = True) -> None:
         self._vcam_enabled = vcam_enabled
         self._vcam_failed = False
+        self._capture_error_reported = False
 
         if self._effects_active:
             self._build_effects_pipeline(vcam_enabled)
@@ -1426,6 +1438,28 @@ class VideoPipeline:
         print(f"[NV Broadcast] Capture error: {err.message}")
         if debug:
             print(f"[NV Broadcast] Debug: {debug}")
+        debug_text = debug or ""
+        try:
+            source_name = msg.src.get_name() or ""
+        except Exception:
+            source_name = ""
+        source_error = (
+            "gstv4l2src" in debug_text.lower()
+            or source_name.lower().startswith("v4l2src")
+        )
+
+        # A physical camera disappearing, becoming busy, or failing its V4L2
+        # poll is not a CUDA failure.  The old behavior demoted GPU transport
+        # and immediately rebuilt against the same dead node, producing a white
+        # preview and a cascade of allocation errors.  Hand it to the app for a
+        # teardown + udev re-enumeration retry instead.
+        if source_error:
+            if not self._capture_error_reported:
+                self._capture_error_reported = True
+                callback = self._capture_error_callback
+                if callback is not None:
+                    GLib.idle_add(callback, err.message, debug_text)
+            return
         # GPU-path capture failures (e.g. caps negotiation) fall back to the
         # legacy BGRA pipeline instead of leaving the camera dead.
         if self._gpu_capture_active and not self._gpu_path_demoted:

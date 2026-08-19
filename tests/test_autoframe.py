@@ -14,6 +14,32 @@ def _make_autoframe() -> AutoFrame:
 
 
 class AutoFrameTests(unittest.TestCase):
+    def test_face_detector_runs_once_per_three_frames(self):
+        af = _make_autoframe()
+        frame = np.zeros((120, 160, 4), dtype=np.uint8)
+
+        with mock.patch.object(af, "_detect_face", return_value=(0.5, 0.5)) as detect:
+            for _ in range(3):
+                af.process_frame_array(frame, 160, 120)
+            self.assertEqual(detect.call_count, 1)
+
+            af.process_frame_array(frame, 160, 120)
+            self.assertEqual(detect.call_count, 2)
+
+    def test_detector_downscales_hd_input(self):
+        af = _make_autoframe()
+        af._mp = mock.Mock()
+        af._mp.ImageFormat.SRGB = "srgb"
+        af._detector = mock.Mock()
+        af._detector.detect_for_video.return_value.detections = []
+        frame = np.zeros((720, 1280, 4), dtype=np.uint8)
+
+        with mock.patch("nvbroadcast.video.autoframe.cv2.cvtColor", wraps=__import__("cv2").cvtColor) as convert:
+            af._detect_face(frame)
+
+        detector_input = convert.call_args.args[0]
+        self.assertEqual(detector_input.shape[:2], (216, 384))
+
     def test_lateral_motion_below_old_dead_zone_still_smooths(self):
         af = _make_autoframe()
         frame = np.zeros((120, 160, 4), dtype=np.uint8)

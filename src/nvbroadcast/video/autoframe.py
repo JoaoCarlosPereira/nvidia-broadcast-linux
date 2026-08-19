@@ -30,6 +30,8 @@ _FACE_DETECTOR_SHA256 = "b4578f35940bf5a1a655214a1cce5cab13eba73c1297cd78e1a04c2
 _MEDIAPIPE_IMPORT_ERROR: str | None = None
 _MEDIAPIPE_READY: bool | None = None
 _MIN_CENTER_TRACKING_ZOOM = 1.12
+_DETECTION_MAX_WIDTH = 384
+_DETECTION_INTERVAL = 3
 
 
 def _probe_mediapipe_runtime() -> tuple[bool, str]:
@@ -99,6 +101,8 @@ class AutoFrame:
         self._smooth_zoom = 1.0
         self._no_face_frames = 0
         self._timestamp_ms = 0
+        self._detection_frame = 0
+        self._last_face_box = None
         self._snap_to_face_on_next_frame = False
         self._mp = None
         self._mp_python = None
@@ -198,10 +202,14 @@ class AutoFrame:
         """Detect face and apply auto-crop/zoom to a BGRA ndarray."""
         if not self._enabled or not self._initialized:
             return frame
-        if not frame.flags.writeable:
-            frame = frame.copy()
 
-        face_box = self._detect_face(frame)
+        # Face motion is slow compared with the video frame rate.  Running the
+        # detector on every third frame avoids making MediaPipe a permanent CPU
+        # bottleneck while the cached position keeps pan/zoom smooth.
+        if self._detection_frame % _DETECTION_INTERVAL == 0:
+            self._last_face_box = self._detect_face(frame)
+        self._detection_frame += 1
+        face_box = self._last_face_box
 
         if face_box is not None:
             self._no_face_frames = 0
@@ -244,7 +252,17 @@ class AutoFrame:
     def _detect_face(self, frame: np.ndarray) -> tuple[float, float] | None:
         """Detect the primary face. Returns (center_x, center_y) normalized [0,1]."""
         try:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
+            detect_frame = frame
+            height, width = frame.shape[:2]
+            if width > _DETECTION_MAX_WIDTH:
+                scale = _DETECTION_MAX_WIDTH / width
+                detect_frame = cv2.resize(
+                    frame,
+                    (_DETECTION_MAX_WIDTH, max(1, round(height * scale))),
+                    interpolation=cv2.INTER_AREA,
+                )
+
+            rgb = cv2.cvtColor(detect_frame, cv2.COLOR_BGRA2RGB)
             mp_image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb)
 
             self._timestamp_ms += 33  # ~30fps
@@ -258,7 +276,7 @@ class AutoFrame:
             bbox = best.bounding_box
 
             # Center of face (normalized to frame dimensions)
-            h, w = frame.shape[:2]
+            h, w = detect_frame.shape[:2]
             cx = (bbox.origin_x + bbox.width / 2) / w
             cy = (bbox.origin_y + bbox.height / 2) / h
 
@@ -296,3 +314,5 @@ class AutoFrame:
             self._detector.close()
             self._detector = None
         self._initialized = False
+        self._detection_frame = 0
+        self._last_face_box = None

@@ -642,7 +642,8 @@ def is_usable_camera_device(device: str, name: str = "") -> bool:
     """Return whether a V4L2 node is a usable physical capture camera."""
     if IS_MACOS:
         return bool(device or name) and not _is_virtual_camera_name(name)
-    if not device.startswith("/dev/video"):
+    resolved_device = os.path.realpath(device)
+    if re.fullmatch(r"/dev/video\d+", resolved_device) is None:
         return False
     if _is_virtual_camera_name(name):
         return False
@@ -662,6 +663,42 @@ def is_usable_camera_device(device: str, name: str = "") -> bool:
     # Prefer cameras with known modes, but do not hide a real capture node when
     # a distro/kernel reports device info but refuses the formats query.
     return bool(list_camera_modes(device)) or has_capture_info
+
+
+def persistent_camera_device(device: str) -> str:
+    """Return a stable udev symlink for a physical camera when available.
+
+    `/dev/videoN` numbering depends on probe order and can change when
+    v4l2loopback loads before a USB webcam.  `by-id` includes the USB serial and
+    survives both reboots and disconnect/reconnect cycles; `by-path` is a useful
+    fallback for cameras that do not publish a serial number.
+    """
+    if IS_MACOS or not device:
+        return device
+
+    resolved = os.path.realpath(device)
+    if re.fullmatch(r"/dev/video\d+", resolved) is None:
+        return device
+
+    for directory in (Path("/dev/v4l/by-id"), Path("/dev/v4l/by-path")):
+        try:
+            entries = sorted(directory.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_symlink() and os.path.realpath(entry) == resolved:
+                    return str(entry)
+            except OSError:
+                continue
+    return device
+
+
+def clear_camera_probe_cache() -> None:
+    """Discard V4L2 probe results after hotplug or a capture failure."""
+    list_camera_format_modes.cache_clear()
+    list_camera_modes.cache_clear()
+    _get_v4l2_device_info.cache_clear()
 
 
 def resolve_camera_device(saved_device: str | None = None) -> str:

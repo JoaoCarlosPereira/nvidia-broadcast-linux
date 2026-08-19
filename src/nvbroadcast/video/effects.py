@@ -60,7 +60,6 @@ def _preload_cuda_libs():
 _preload_cuda_libs()
 import onnxruntime as ort
 
-from nvbroadcast.core.constants import COMPUTE_GPU_INDEX
 from nvbroadcast.core.model_download import download_verified_model
 
 _MODELS_DIR = Path(__file__).parent.parent.parent.parent / "models"
@@ -1506,7 +1505,7 @@ class _LearnedMatteRefiner:
 class VideoEffects:
     _DETAIL_QUALITY_PRESETS = frozenset({"quality", "ultra"})
 
-    def __init__(self, gpu_index: int = COMPUTE_GPU_INDEX, edge_config=None,
+    def __init__(self, gpu_index: int = 0, edge_config=None,
                  compositing: str = "cpu"):
         self._gpu_index = gpu_index
         self._initialized = False

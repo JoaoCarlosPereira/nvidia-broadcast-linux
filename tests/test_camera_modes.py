@@ -1,5 +1,6 @@
 import subprocess
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from nvbroadcast.video.virtual_camera import (
@@ -7,6 +8,7 @@ from nvbroadcast.video.virtual_camera import (
     list_camera_devices,
     list_camera_format_modes,
     list_camera_modes,
+    persistent_camera_device,
     select_camera_mode,
     select_camera_capture_format,
 )
@@ -232,6 +234,32 @@ Device Caps     : 0x04200001
                 list_camera_devices(),
                 [{"name": "USB Camera", "device": "/dev/video2"}],
             )
+
+    def test_persistent_camera_device_prefers_usb_by_id_symlink(self):
+        entry = Path("/dev/v4l/by-id/usb-Test_Camera-serial-video-index0")
+
+        def fake_iterdir(path):
+            if str(path) == "/dev/v4l/by-id":
+                return iter([entry])
+            return iter([])
+
+        def fake_realpath(path):
+            value = str(path)
+            if value in {"/dev/video2", str(entry)}:
+                return "/dev/video2"
+            return value
+
+        with mock.patch.object(
+            Path, "iterdir", autospec=True, side_effect=fake_iterdir
+        ), mock.patch.object(
+            Path, "is_symlink", autospec=True, return_value=True
+        ), mock.patch(
+            "nvbroadcast.video.virtual_camera.os.path.realpath",
+            side_effect=fake_realpath,
+        ):
+            stable = persistent_camera_device("/dev/video2")
+
+        self.assertEqual(stable, str(entry))
 
 
 if __name__ == "__main__":

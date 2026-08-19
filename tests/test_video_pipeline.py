@@ -20,6 +20,48 @@ class VideoPipelineRebuildTests(unittest.TestCase):
         fake_pipeline.get_bus.return_value = fake_bus
         return fake_pipeline
 
+    def test_v4l2_source_error_requests_recovery_without_gpu_demotion(self):
+        pipeline = VideoPipeline()
+        pipeline._gpu_capture_active = True
+        callback = mock.Mock(return_value=False)
+        pipeline.set_capture_error_callback(callback)
+        message = mock.Mock()
+        message.parse_error.return_value = (
+            SimpleNamespace(message="device vanished"),
+            "../sys/v4l2/gstv4l2src.c: /GstV4l2Src:v4l2src0",
+        )
+
+        with mock.patch(
+            "nvbroadcast.video.pipeline.GLib.idle_add",
+            side_effect=lambda func, *args: func(*args),
+        ):
+            pipeline._on_error(None, message)
+            pipeline._on_error(None, message)
+
+        callback.assert_called_once()
+        self.assertFalse(pipeline._gpu_path_demoted)
+
+    def test_v4l2_source_name_is_recognized_without_debug_text(self):
+        pipeline = VideoPipeline()
+        pipeline._gpu_capture_active = True
+        callback = mock.Mock(return_value=False)
+        pipeline.set_capture_error_callback(callback)
+        message = mock.Mock()
+        message.src.get_name.return_value = "v4l2src0"
+        message.parse_error.return_value = (
+            SimpleNamespace(message="failed to allocate a buffer"),
+            None,
+        )
+
+        with mock.patch(
+            "nvbroadcast.video.pipeline.GLib.idle_add",
+            side_effect=lambda func, *args: func(*args),
+        ):
+            pipeline._on_error(None, message)
+
+        callback.assert_called_once()
+        self.assertFalse(pipeline._gpu_path_demoted)
+
     def test_effects_pipeline_uses_raw_source_without_jpeg_decode(self):
         pipeline = VideoPipeline()
         with mock.patch(

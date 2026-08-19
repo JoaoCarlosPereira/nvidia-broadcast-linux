@@ -7,6 +7,7 @@
 
 import json
 import os
+import threading
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,6 +39,10 @@ class BeautyConfig:
 @dataclass
 class VideoConfig:
     camera_device: str = "/dev/video0"
+    # Stable Linux udev symlink (normally /dev/v4l/by-id/...).  Keep the
+    # transient /dev/videoN separately because UI/device APIs expose it, but
+    # use this identity to find the same physical camera after a reboot.
+    camera_device_id: str = ""
     vcam_device: str = VIRTUAL_CAM_DEVICE
     width: int = 1280
     height: int = 720
@@ -365,19 +370,34 @@ def _bool(val: bool) -> str:
     return "true" if val else "false"
 
 
+_CONFIG_LOCK = threading.Lock()
+
+
+def _str_val(val: str) -> str:
+    return json.dumps(val or "", ensure_ascii=True)
+
+
+_CONFIG_LOCK = threading.Lock()
+
+
+def _str_val(val: str) -> str:
+    return json.dumps(val or "", ensure_ascii=True)
+
+
 def _config_to_toml(config: AppConfig) -> str:
-    """Serialize AppConfig to TOML string (complete — all fields)."""
     v = config.video
+    e = config.video.edge
+    b = config.video.beauty
     a = config.audio
     h = config.hotkeys
-    b = v.beauty
-    e = v.edge
+
     lines = [
+        "# NV Broadcast configuration",
         f"compute_gpu = {config.compute_gpu}",
-        f'compute_focus = "{config.compute_focus}"',
-        f'performance_profile = "{config.performance_profile}"',
-        f'compositing = "{config.compositing}"',
-        f'mode_key = "{config.mode_key}"',
+        f"compute_focus = {_str_val(config.compute_focus)}",
+        f"performance_profile = {_str_val(config.performance_profile)}",
+        f"compositing = {_str_val(config.compositing)}",
+        f"mode_key = {_str_val(config.mode_key)}",
         f"auto_mode = {_bool(config.auto_mode)}",
         f"premium_edge_refine = {_bool(config.premium_edge_refine)}",
         f"use_tensorrt = {_bool(config.use_tensorrt)}",
@@ -388,33 +408,34 @@ def _config_to_toml(config: AppConfig) -> str:
         f"minimize_on_close = {_bool(config.minimize_on_close)}",
         f"check_for_updates = {_bool(config.check_for_updates)}",
         f"last_update_check = {config.last_update_check}",
-        f'last_notified_version = "{config.last_notified_version}"',
-        f'last_python_runtime_notice = "{config.last_python_runtime_notice}"',
+        f"last_notified_version = {_str_val(config.last_notified_version)}",
+        f"last_python_runtime_notice = {_str_val(config.last_python_runtime_notice)}",
         f"first_run = {_bool(config.first_run)}",
-        f'current_profile = "{config.current_profile}"',
+        f"current_profile = {_str_val(config.current_profile)}",
         "",
         "[video]",
-        f'camera_device = "{v.camera_device}"',
-        f'vcam_device = "{v.vcam_device}"',
+        f"camera_device = {_str_val(v.camera_device)}",
+        f"camera_device_id = {_str_val(v.camera_device_id)}",
+        f"vcam_device = {_str_val(v.vcam_device)}",
         f"width = {v.width}",
         f"height = {v.height}",
         f"fps = {v.fps}",
-        f'output_format = "{v.output_format}"',
-        f'model = "{v.model}"',
-        f'quality_preset = "{v.quality_preset}"',
+        f"output_format = {_str_val(v.output_format)}",
+        f"model = {_str_val(v.model)}",
+        f"quality_preset = {_str_val(v.quality_preset)}",
         f"background_removal = {_bool(v.background_removal)}",
-        f'background_mode = "{v.background_mode}"',
-        f'background_image = "{v.background_image}"',
+        f"background_mode = {_str_val(v.background_mode)}",
+        f"background_image = {_str_val(v.background_image)}",
         f"blur_intensity = {v.blur_intensity}",
         f"blur_dim = {v.blur_dim}",
         f"blur_desaturate = {v.blur_desaturate}",
         f"auto_frame = {_bool(v.auto_frame)}",
         f"auto_frame_zoom = {v.auto_frame_zoom}",
-        f'auto_frame_mode = "{v.auto_frame_mode}"',
+        f"auto_frame_mode = {_str_val(v.auto_frame_mode)}",
         f"mirror = {_bool(v.mirror)}",
         f"eye_contact = {_bool(v.eye_contact)}",
         f"eye_contact_intensity = {v.eye_contact_intensity}",
-        f'eye_contact_mode = "{v.eye_contact_mode}"',
+        f"eye_contact_mode = {_str_val(v.eye_contact_mode)}",
         f"relighting = {_bool(v.relighting)}",
         f"relighting_intensity = {v.relighting_intensity}",
         "",
@@ -426,7 +447,7 @@ def _config_to_toml(config: AppConfig) -> str:
         "",
         "[video.beauty]",
         f"enabled = {_bool(b.enabled)}",
-        f'preset = "{b.preset}"',
+        f"preset = {_str_val(b.preset)}",
         f"skin_smooth = {b.skin_smooth}",
         f"denoise = {b.denoise}",
         f"enhance = {b.enhance}",
@@ -434,15 +455,15 @@ def _config_to_toml(config: AppConfig) -> str:
         f"edge_darken = {b.edge_darken}",
         "",
         "[audio]",
-        f'mic_device = "{a.mic_device}"',
-        f'speaker_device = "{a.speaker_device}"',
+        f"mic_device = {_str_val(a.mic_device)}",
+        f"speaker_device = {_str_val(a.speaker_device)}",
         f"noise_removal = {_bool(a.noise_removal)}",
         f"noise_intensity = {a.noise_intensity}",
-        f'noise_engine = "{a.noise_engine}"',
+        f"noise_engine = {_str_val(a.noise_engine)}",
         f"speaker_denoise = {_bool(a.speaker_denoise)}",
         f"voice_fx_enabled = {_bool(a.voice_fx_enabled)}",
         f"voice_fx_use_gpu = {_bool(a.voice_fx_use_gpu)}",
-        f'voice_fx_preset = "{a.voice_fx_preset}"',
+        f"voice_fx_preset = {_str_val(a.voice_fx_preset)}",
         f"voice_fx_bass_boost = {a.voice_fx_bass_boost}",
         f"voice_fx_treble = {a.voice_fx_treble}",
         f"voice_fx_warmth = {a.voice_fx_warmth}",
@@ -463,23 +484,18 @@ def _config_to_toml(config: AppConfig) -> str:
             lines.append(f"{key} = {_bool(config.ui_card_expanded[key])}")
     return "\n".join(lines) + "\n"
 
-
 def save_config(config: AppConfig) -> None:
-    """Atomically persist the config and keep the previous file as backup.
-
-    write_text truncates in place, so a crash mid-save left a corrupt file
-    and the next start silently reset every setting. Write to a temp file
-    and rename over the target instead; rename is atomic on POSIX.
-    """
+    """Atomically persist the config under a lock and keep the previous file as backup."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    if CONFIG_FILE.exists():
-        try:
-            os.replace(CONFIG_FILE, CONFIG_FILE.with_suffix(".toml.bak"))
-        except OSError:
-            pass
-    tmp = CONFIG_FILE.with_suffix(".toml.tmp")
-    tmp.write_text(_config_to_toml(config))
-    os.replace(tmp, CONFIG_FILE)
+    with _CONFIG_LOCK:
+        if CONFIG_FILE.exists():
+            try:
+                os.replace(CONFIG_FILE, CONFIG_FILE.with_suffix(".toml.bak"))
+            except OSError:
+                pass
+        tmp = CONFIG_FILE.with_suffix(".toml.tmp")
+        tmp.write_text(_config_to_toml(config))
+        os.replace(tmp, CONFIG_FILE)
 
 
 # ─── User Profiles ───────────────────────────────────────────────────────────
@@ -496,11 +512,14 @@ def list_profiles() -> list[str]:
 
 
 def save_profile(name: str, config: AppConfig) -> Path:
-    """Save current config as a named profile."""
+    """Save current config as a named profile atomically."""
     PROFILES_DIR.mkdir(parents=True, exist_ok=True)
     safe_name = "".join(c for c in name if c.isalnum() or c in " _-").strip()
     filepath = PROFILES_DIR / f"{safe_name}.toml"
-    filepath.write_text(_config_to_toml(config))
+    tmp = filepath.with_suffix(".tmp")
+    with _CONFIG_LOCK:
+        tmp.write_text(_config_to_toml(config))
+        os.replace(tmp, filepath)
     return filepath
 
 

@@ -31,11 +31,16 @@ def _build_pipeline(state: dict) -> AudioPipeline:
     # Power Save is camera-only. A dormant virtual microphone can make some
     # Pulse/PipeWire clients retain a multi-second capture buffer after resume.
     pipeline.auto_idle = False
-    # Engine preference must be set before `enabled` — enabling triggers
-    # initialization, which chooses the engine.
+    # Engine and intensity must be set before `enabled` — enabling triggers
+    # initialization, which chooses the engine.  Zero intensity is a true
+    # bypass; do not spend an entire CPU core running DeepFilterNet only to mix
+    # 100% of the dry signal back into the result.
+    noise_intensity = max(0.0, min(1.0, float(state.get("noise_intensity", 1.0))))
     pipeline.effects.engine = str(state.get("noise_engine", "auto"))
-    pipeline.effects.enabled = bool(state.get("noise_removal", False))
-    pipeline.effects.intensity = float(state.get("noise_intensity", 1.0))
+    pipeline.effects.intensity = noise_intensity
+    pipeline.effects.enabled = (
+        bool(state.get("noise_removal", False)) and noise_intensity > 0.0
+    )
     pipeline.voice_fx.enabled = bool(state.get("voice_fx_enabled", False))
     pipeline.voice_fx.use_gpu = bool(state.get("voice_fx_use_gpu", True))
 

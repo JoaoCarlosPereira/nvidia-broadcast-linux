@@ -12,6 +12,7 @@ gi.require_version("Adw", "1")
 gi.require_version("Gdk", "4.0")
 from gi.repository import Gtk, Adw, Gio, GLib, Gdk
 
+from nvbroadcast.core.modes import MODE_MAP, mode_status_message
 from nvbroadcast.core.constants import APP_NAME, APP_SUBTITLE, VIRTUAL_CAM_DEVICE
 from nvbroadcast.core.config import save_config
 from nvbroadcast.core.gpu import detect_gpus, select_compute_gpu
@@ -1286,6 +1287,13 @@ class NVBroadcastWindow(Adw.ApplicationWindow):
         if profile == "potato":
             return "cpu_low"
         return "cpu_quality"
+
+    def update_edge_controls(self, edge_config):
+        if hasattr(self, "_edge_dilate") and self._edge_dilate:
+            self._edge_dilate._scale.set_value(edge_config.dilate_size)
+            self._edge_blur._scale.set_value(edge_config.blur_size)
+            self._edge_strength._scale.set_value(edge_config.sigmoid_strength)
+            self._edge_midpoint._scale.set_value(edge_config.sigmoid_midpoint)
 
     # (profile, compositing, use_tensorrt, use_fused_kernel, use_nvdec)
     _MODE_MAP = {

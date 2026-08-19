@@ -53,6 +53,28 @@ class AppAudioPolicyTests(unittest.TestCase):
         save_config.assert_called_once_with(fake.config)
         fake._restart_audio_pipeline_for_live_settings.assert_not_called()
 
+    @mock.patch("nvbroadcast.app.save_config")
+    def test_noise_toggle_restarts_running_audio_helper(self, save_config):
+        effects = SimpleNamespace(engine="rnnoise", enabled=False)
+        pipeline = SimpleNamespace(effects=effects)
+        fake = SimpleNamespace(
+            config=SimpleNamespace(
+                audio=SimpleNamespace(noise_removal=False, noise_engine="auto")
+            ),
+            _ensure_audio_pipeline=mock.Mock(return_value=pipeline),
+            _refresh_audio_pipeline=mock.Mock(),
+            _restart_audio_pipeline_for_live_settings=mock.Mock(),
+        )
+
+        NVBroadcastApp.set_noise_removal(fake, True)
+
+        self.assertTrue(fake.config.audio.noise_removal)
+        self.assertEqual(effects.engine, "auto")
+        self.assertTrue(effects.enabled)
+        fake._refresh_audio_pipeline.assert_called_once_with()
+        fake._restart_audio_pipeline_for_live_settings.assert_called_once_with()
+        save_config.assert_called_once_with(fake.config)
+
     def test_transcriber_preload_waits_while_streaming(self):
         fake = SimpleNamespace(
             _meeting_active=False,

@@ -23,9 +23,12 @@ gi.require_version("Adw", "1")
 gi.require_version("Gst", "1.0")
 from gi.repository import Gtk, Adw, Gst, Gio, Gdk, GLib
 
+from nvbroadcast.core.state import AppState, EffectHealth
+from nvbroadcast.core.orchestrator import DefaultSessionOrchestrator
+from nvbroadcast.core.device_supervisor import DeviceSupervisor
+from nvbroadcast.core.modes import MODE_MAP, mode_status_message
 from nvbroadcast.core.constants import (
     APP_ID,
-    COMPUTE_GPU_INDEX,
     VIRTUAL_CAM_DEVICE,
 )
 from nvbroadcast.core import startup_trace
@@ -193,6 +196,14 @@ class NVBroadcastApp(Adw.Application):
         self._pending_start = None
         self._restart_source_id = 0
         self._pipeline_teardown = None
+        self._camera_recovery_source_id = 0
+        self._camera_recovery_attempts = 0
+        self._camera_recovery_target = ""
+        self._camera_recovery_format = "YUY2"
+        self._camera_watchdog_source_id = 0
+        self._vcam_consumer_check_source_id = 0
+        self._auto_tune_source_id = 0
+        self._idle_wake_source_id = 0
         self._auto_tune_low_streak = 0
         self._auto_tune_high_streak = 0
         self._last_auto_tune_change = 0.0
@@ -203,7 +214,38 @@ class NVBroadcastApp(Adw.Application):
         self._hotkey_active = False
         self._hotkey_status = "Global hotkeys are unavailable"
         self._hotkey_display: dict[str, str] = {}
+        self.device_supervisor = DeviceSupervisor(
+            self.config,
+            on_camera_switch=lambda dev: self.start_pipeline(
+                dev, self.config.video.output_format
+            ),
+            on_microphone_switch=lambda _dev: (
+                self._rebuild_audio_pipeline(
+                    restart=bool(
+                        self._audio_pipeline
+                        and self._audio_pipeline._running
+                    )
+                )
+                if self._audio_pipeline is not None
+                else None
+            ),
+            on_health=self._on_device_health,
+        )
+        self.orchestrator = DefaultSessionOrchestrator(
+            self.config,
+            start_fn=lambda: bool(self.start_pipeline(self.config.video.camera_device)),
+            stop_fn=lambda: self.stop_pipeline(),
+            device_supervisor=self.device_supervisor,
+        )
         self._transcriber.set_segment_callback(self._on_transcript_segment)
+
+    def _on_device_health(
+        self, device_kind: str, health: EffectHealth, message: str
+    ) -> None:
+        self.orchestrator.state.effects_health[device_kind] = health
+        self.orchestrator.state.status_message = message
+        if self._window is not None and message:
+            self._window.set_status(message)
 
     def do_startup(self):
         startup_trace.mark("do_startup begin")
@@ -354,11 +396,11 @@ class NVBroadcastApp(Adw.Application):
             # Camera power save: poll for vcam consumers. Seconds-granularity
             # so GLib can coalesce the wakeup; the 1s _idle_wake_tick handles
             # fast wake-from-idle, this poll only latches idle entry.
-            GLib.timeout_add_seconds(10, self._check_vcam_consumers)
+            self._vcam_consumer_check_source_id = GLib.timeout_add_seconds(10, self._check_vcam_consumers)
 
             # Start performance monitor
             self._perf_monitor.start()
-            GLib.timeout_add(2500, self._auto_tune_tick)
+            self._auto_tune_source_id = GLib.timeout_add(2500, self._auto_tune_tick)
 
             # Intercept window close -> minimize to background instead of quit
             self._window.connect("close-request", self._on_close_request)
@@ -437,7 +479,7 @@ class NVBroadcastApp(Adw.Application):
         if expected_quality:
             self.config.video.quality_preset = expected_quality
             self._video_effects._quality = expected_quality
-        mapped = NVBroadcastWindow._MODE_MAP.get(self.config.mode_key)
+        mapped = MODE_MAP.get(self.config.mode_key)
         if mapped is not None:
             _, _, use_tensorrt, use_fused_kernel, use_nvdec = mapped
         else:
@@ -1009,7 +1051,7 @@ class NVBroadcastApp(Adw.Application):
         self._perf_monitor.set_gpu_index(c.compute_gpu)
         self._video_effects.set_compositing(c.compositing)
         self._beautifier.set_compositing(c.compositing)
-        mapped = NVBroadcastWindow._MODE_MAP.get(c.mode_key)
+        mapped = MODE_MAP.get(c.mode_key)
         if mapped is not None:
             _, _, use_tensorrt, use_fused_kernel, use_nvdec = mapped
         else:
@@ -1181,6 +1223,121 @@ class NVBroadcastApp(Adw.Application):
 
     # --- Video Pipeline ---
 
+    def _cancel_camera_watchdog(self):
+        if self._camera_watchdog_source_id:
+            GLib.source_remove(self._camera_watchdog_source_id)
+            self._camera_watchdog_source_id = 0
+        self._vcam_consumer_check_source_id = 0
+        self._auto_tune_source_id = 0
+        self._idle_wake_source_id = 0
+
+    def _cancel_camera_recovery(self):
+        if self._camera_recovery_source_id:
+            GLib.source_remove(self._camera_recovery_source_id)
+            self._camera_recovery_source_id = 0
+        self._camera_recovery_attempts = 0
+
+    def _schedule_camera_recovery(self, camera_device: str, output_format: str):
+        """Wait for udev to recreate a disconnected physical camera."""
+        self._camera_recovery_target = camera_device
+        self._camera_recovery_format = output_format
+        if self._camera_recovery_source_id:
+            return
+        self._camera_recovery_attempts = 0
+        self._camera_recovery_source_id = GLib.timeout_add_seconds(
+            1, self._camera_recovery_tick
+        )
+
+    def _camera_recovery_tick(self):
+        from nvbroadcast.video.virtual_camera import (
+            clear_camera_probe_cache,
+            is_usable_camera_device,
+            resolve_camera_device,
+        )
+
+        self._camera_recovery_attempts += 1
+        clear_camera_probe_cache()
+        target = self._camera_recovery_target or self.config.video.camera_device
+        stable_id = getattr(self.config.video, "camera_device_id", "")
+        candidate = stable_id or target
+        # A stable ID names one particular camera.  Do not silently switch to
+        # another webcam while that device is still being enumerated by udev.
+        resolved = (
+            candidate if stable_id and is_usable_camera_device(candidate)
+            else "" if stable_id
+            else resolve_camera_device(candidate)
+        )
+        if resolved and is_usable_camera_device(resolved):
+            self._camera_recovery_source_id = 0
+            self._camera_recovery_attempts = 0
+            if hasattr(self, "device_supervisor"):
+                self.device_supervisor._set_health(
+                    "camera", EffectHealth.OK, "Camera reconnected",
+                )
+            if self._window:
+                self._window.set_status("Camera reconnected - restarting...")
+            self.start_pipeline(resolved, self._camera_recovery_format)
+            return False
+
+        if self._camera_recovery_attempts >= 20:
+            self._camera_recovery_source_id = 0
+            if hasattr(self, "device_supervisor"):
+                self.device_supervisor._set_health(
+                    "camera",
+                    EffectHealth.FAILED,
+                    "Camera recovery timed out",
+                    self._camera_recovery_attempts,
+                )
+            if self._window:
+                self._window.set_status(
+                    "Camera unavailable. Reconnect it, then press Start Broadcast."
+                )
+            print("[NV Broadcast] Camera recovery timed out", flush=True)
+            return False
+
+        if self._window and self._camera_recovery_attempts in (1, 5, 10, 15):
+            self._window.set_status("Waiting for physical camera...")
+        return True
+
+    def _on_capture_error(self, pipeline, message: str, debug: str):
+        """Tear down a dead V4L2 source and recover after hotplug settles."""
+        if pipeline is not self._video_pipeline:
+            return False
+        if hasattr(self, "device_supervisor"):
+            self.device_supervisor.mark_camera_failed(message)
+        print(
+            f"[NV Broadcast] Physical camera failed; scheduling recovery: {message}",
+            flush=True,
+        )
+        target = getattr(self.config.video, "camera_device_id", "") \
+            or self.config.video.camera_device
+        output_format = self.config.video.output_format
+        self.stop_pipeline(clear_pending_start=True, cancel_camera_recovery=False)
+        if self._window:
+            self._window._streaming = False
+            self._window._stream_btn.set_label("Start Broadcast")
+            self._window._stream_btn.remove_css_class("destructive-action")
+            self._window._stream_btn.add_css_class("suggested-action")
+            self._window.set_status("Camera disconnected - recovering...")
+        self._schedule_camera_recovery(target, output_format)
+        return False
+
+    def _camera_start_watchdog(self, pipeline):
+        """Recover a PLAYING pipeline that negotiated but delivered no frame."""
+        self._camera_watchdog_source_id = 0
+        self._vcam_consumer_check_source_id = 0
+        self._auto_tune_source_id = 0
+        self._idle_wake_source_id = 0
+        if pipeline is not self._video_pipeline or not self._streaming:
+            return False
+        if pipeline._frame_count > 0:
+            return False
+        return self._on_capture_error(
+            pipeline,
+            "no frames received during startup",
+            "capture watchdog expired",
+        )
+
     def _clear_finished_teardown(self):
         if self._pipeline_teardown and self._pipeline_teardown._teardown_done:
             self._pipeline_teardown = None
@@ -1191,6 +1348,8 @@ class NVBroadcastApp(Adw.Application):
         self._restart_source_id = GLib.timeout_add(100, self._restart_after_stop)
 
     def start_pipeline(self, camera_device: str, output_format: str = "YUY2"):
+        self._cancel_camera_recovery()
+        self._cancel_camera_watchdog()
         self._clear_finished_teardown()
         self._pending_start = (camera_device, output_format)
 
@@ -1236,17 +1395,40 @@ class NVBroadcastApp(Adw.Application):
 
         startup_trace.mark("start_pipeline begin")
         from nvbroadcast.core.config import PERFORMANCE_PROFILES
-        from nvbroadcast.video.virtual_camera import resolve_camera_device, select_camera_mode
-
-        resolved_camera = resolve_camera_device(
-            camera_device or self.config.video.camera_device
+        from nvbroadcast.video.virtual_camera import (
+            clear_camera_probe_cache,
+            is_usable_camera_device,
+            persistent_camera_device,
+            resolve_camera_device,
+            select_camera_mode,
         )
-        if resolved_camera != camera_device:
+
+        requested_camera = camera_device or self.config.video.camera_device
+        stable_id = getattr(self.config.video, "camera_device_id", "")
+        candidate = stable_id or requested_camera
+        clear_camera_probe_cache()
+        resolved_camera = (
+            candidate if stable_id and is_usable_camera_device(candidate)
+            else "" if stable_id
+            else resolve_camera_device(candidate)
+        )
+        if not resolved_camera or not is_usable_camera_device(resolved_camera):
             print(
-                f"[NV Broadcast] Camera changed: {camera_device} -> {resolved_camera}",
+                f"[NV Broadcast] Physical camera unavailable: {candidate}",
                 flush=True,
             )
-            camera_device = resolved_camera
+            if self._window:
+                self._window.set_status("Waiting for physical camera...")
+            self._schedule_camera_recovery(candidate, output_format)
+            return False
+
+        persistent_id = persistent_camera_device(resolved_camera)
+        camera_device = os.path.realpath(resolved_camera)
+        if resolved_camera != camera_device:
+            print(
+                f"[NV Broadcast] Camera resolved: {resolved_camera} -> {camera_device}",
+                flush=True,
+            )
 
         selected_mode = select_camera_mode(
             camera_device,
@@ -1304,6 +1486,12 @@ class NVBroadcastApp(Adw.Application):
         self._video_pipeline.set_preview_callback(
             lambda texture: self._window.update_preview(texture)
         )
+        pipeline = self._video_pipeline
+        self._video_pipeline.set_capture_error_callback(
+            lambda message, debug: self._on_capture_error(
+                pipeline, message, debug
+            )
+        )
 
         # Reset all resolution-dependent state BEFORE new pipeline processes frames
         self._video_effects.reset_cached_mattes()
@@ -1326,6 +1514,10 @@ class NVBroadcastApp(Adw.Application):
             self._video_pipeline.start()
             startup_trace.mark("pipeline started")
             self._streaming = True
+            self._cancel_camera_watchdog()
+            self._camera_watchdog_source_id = GLib.timeout_add_seconds(
+                4, self._camera_start_watchdog, self._video_pipeline
+            )
 
             w, h = self.config.video.width, self.config.video.height
             status = f"Streaming: {camera_device} {w}x{h}@{self.config.video.fps}fps"
@@ -1338,6 +1530,9 @@ class NVBroadcastApp(Adw.Application):
                 status += " - virtual camera unavailable"
             self._window.set_status(status)
             self.config.video.camera_device = camera_device
+            self.config.video.camera_device_id = (
+                persistent_id if persistent_id != camera_device else ""
+            )
             self.config.video.output_format = output_format
             save_config(self.config)
 
@@ -1353,9 +1548,13 @@ class NVBroadcastApp(Adw.Application):
 
         return False  # Don't repeat (for GLib.timeout_add)
 
-    def stop_pipeline(self, clear_pending_start: bool = True):
+    def stop_pipeline(self, clear_pending_start: bool = True,
+                      cancel_camera_recovery: bool = True):
         if clear_pending_start:
             self._pending_start = None
+        self._cancel_camera_watchdog()
+        if cancel_camera_recovery:
+            self._cancel_camera_recovery()
         self._idle_active = False
         self._idle_strikes = 0
         if self._restart_source_id:
@@ -1709,7 +1908,7 @@ class NVBroadcastApp(Adw.Application):
 
     def apply_mode_key(self, mode_key: str, status: str | None = None) -> bool:
         """Apply one of the stable named modes and sync related UI state."""
-        mapped = NVBroadcastWindow._MODE_MAP.get(mode_key)
+        mapped = MODE_MAP.get(mode_key)
         if mapped is None:
             return False
 
@@ -2725,6 +2924,9 @@ class NVBroadcastApp(Adw.Application):
         return list_microphones()
 
     def set_microphone(self, device: str):
+        if hasattr(self, "device_supervisor"):
+            self.orchestrator.switch_microphone(device)
+            return
         self.config.audio.mic_device = device
         save_config(self.config)
         if self._audio_pipeline is not None:
@@ -2740,6 +2942,9 @@ class NVBroadcastApp(Adw.Application):
 
     def switch_camera(self, device: str):
         """Hot-switch to a different camera device."""
+        if hasattr(self, "device_supervisor"):
+            self.orchestrator.switch_camera(device)
+            return
         if self.config.video.camera_device == device:
             return
 
@@ -2752,6 +2957,7 @@ class NVBroadcastApp(Adw.Application):
             self.config.video.fps,
         )
         self.config.video.camera_device = device
+        self.config.video.camera_device_id = ""
         self.config.video.width = selected_mode["width"]
         self.config.video.height = selected_mode["height"]
         self.config.video.fps = selected_mode["fps"]
@@ -2869,6 +3075,11 @@ class NVBroadcastApp(Adw.Application):
         pipeline.effects.engine = self.config.audio.noise_engine
         pipeline.effects.enabled = enabled
         self._refresh_audio_pipeline()
+        # The Linux virtual microphone runs in a helper process whose settings
+        # are serialized at startup.  Calling start() on an already-running
+        # helper is a no-op, so toggling denoise previously changed only the UI
+        # and config while the live microphone remained unprocessed.
+        self._restart_audio_pipeline_for_live_settings()
         save_config(self.config)
 
     def set_noise_engine(self, engine: str):
@@ -2952,9 +3163,14 @@ class NVBroadcastApp(Adw.Application):
             speaker_device=self.config.audio.speaker_device,
             sample_rate=48000,
         )
-        monitor.build()
-        monitor.effects.enabled = True
-        monitor.start()
+        try:
+            monitor.build()
+            monitor.effects.enabled = True
+            monitor.start()
+        except Exception as exc:
+            print(f"[NV Broadcast] Speaker monitor failed to start: {exc}", flush=True)
+            if self._window:
+                self._window.set_status(f"Speaker denoise failed: {exc}")
 
     def set_speaker_denoise(self, enabled: bool):
         self.config.audio.speaker_denoise = enabled
@@ -2967,8 +3183,28 @@ class NVBroadcastApp(Adw.Application):
 
     # --- Lifecycle ---
 
+    def _cancel_glib_timers(self):
+        for attr in (
+            "_vcam_consumer_check_source_id",
+            "_auto_tune_source_id",
+            "_idle_wake_source_id",
+            "_restart_source_id",
+            "_camera_recovery_source_id",
+            "_camera_watchdog_source_id",
+        ):
+            source_id = getattr(self, attr, 0)
+            if source_id:
+                try:
+                    GLib.source_remove(source_id)
+                except Exception:
+                    pass
+                setattr(self, attr, 0)
+
     def do_shutdown(self):
+        self._cancel_glib_timers()
         save_config(self.config)
+        self._cancel_camera_watchdog()
+        self._cancel_camera_recovery()
         if self._hotkey_manager is not None:
             self._hotkey_manager.close()
             self._hotkey_manager = None

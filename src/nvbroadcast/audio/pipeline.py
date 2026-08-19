@@ -79,6 +79,7 @@ class AudioPipeline:
         self._use_helper_process = bool(use_helper_process)
         self._output_frames_pushed = 0
         self._stereo_scratch: np.ndarray | None = None
+        self._dropped_audio_frames = 0
         self._output_buffer_queue: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=64)
         self._output_worker: threading.Thread | None = None
         self._stop_output_worker = threading.Event()

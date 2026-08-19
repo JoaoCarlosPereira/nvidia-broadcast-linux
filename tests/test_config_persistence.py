@@ -29,6 +29,7 @@ class ConfigPersistenceTests(unittest.TestCase):
         config.video.height = 600
         config.video.fps = 30
         config.video.output_format = "I420"
+        config.video.camera_device_id = "/dev/v4l/by-id/test-camera"
         config.video.vcam_device = "/dev/video11"
         config.video.auto_frame_mode = "stable"
         config.video.eye_contact_mode = "gaze_lock"
@@ -64,6 +65,9 @@ class ConfigPersistenceTests(unittest.TestCase):
         })
         self.assertEqual((loaded.video.width, loaded.video.height, loaded.video.fps), (800, 600, 30))
         self.assertEqual(loaded.video.output_format, "I420")
+        self.assertEqual(
+            loaded.video.camera_device_id, "/dev/v4l/by-id/test-camera"
+        )
         self.assertEqual(loaded.video.vcam_device, "/dev/video11")
         self.assertEqual(loaded.video.auto_frame_mode, "stable")
         self.assertEqual(loaded.video.eye_contact_mode, "gaze_lock")

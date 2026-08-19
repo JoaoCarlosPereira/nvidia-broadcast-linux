@@ -109,8 +109,6 @@ class SpeakerMonitor:
     def _teardown_pipeline(self):
         if self._pipeline:
             self._pipeline.set_state(Gst.State.NULL)
-        if self._bus:
-            self._bus.remove_signal_watch()
         self._pipeline = None
         self._bus = None
         self._appsrc = None
@@ -126,6 +124,11 @@ class SpeakerMonitor:
         self._pipeline = Gst.Pipeline.new("nvbroadcast-speaker")
         capture_backend, capture_target = self._select_capture_backend()
         output_backend, output_target = self._select_output_backend()
+
+        # Acoustic/digital loop protection: prevent capturing monitor and playing back to the same sink
+        if capture_target and output_target and capture_target == output_target:
+            print(f"[NVIDIA Broadcast Speaker] Refusing to build pipeline: capture target equals output target ({capture_target})", flush=True)
+            raise ValueError(f"Loop risk: capture target and output target are identical ({capture_target})")
 
         source = self._make_source(capture_backend, capture_target)
 
